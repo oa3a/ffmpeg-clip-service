@@ -1,5 +1,4 @@
 const express = require("express");
-const fetch = require("node-fetch");
 const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
@@ -9,82 +8,82 @@ const { v4: uuidv4 } = require("uuid");
 const app = express();
 app.use(express.json({ limit: "100mb" }));
 
+// Helper to run commands as Promise
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args);
+    let stderr = "";
+
+    p.stderr.on("data", (d) => (stderr += d.toString()));
+    p.on("close", (code) => {
+      if (code !== 0) reject(stderr);
+      else resolve();
+    });
+  });
+}
+
 app.post("/clip", async (req, res) => {
+  const { vodUrl, startTime, endTime } = req.body;
+
+  if (!vodUrl) {
+    return res.status(400).json({ error: "vodUrl is required" });
+  }
+
+  console.log("Received:", vodUrl);
+
+  const tmp = os.tmpdir();
+  const downloadPath = path.join(tmp, `vod-${uuidv4()}.mp4`);
+  const clipPath = path.join(tmp, `clip-${uuidv4()}.mp4`);
+
   try {
-    const { vodUrl, startTime, endTime } = req.body;
+    // STEP 1 — Download VOD using yt-dlp
+    console.log("Downloading VOD with yt-dlp...");
+    await run("yt-dlp", [
+      "-f", "best",
+      vodUrl,
+      "-o", downloadPath
+    ]);
 
-    if (!vodUrl) {
-      return res.status(400).json({ error: "vodUrl missing" });
+    console.log("Download complete:", downloadPath);
+
+    if (!fs.existsSync(downloadPath)) {
+      throw new Error("yt-dlp failed: file not created");
     }
 
-    console.log("Railway: received vodUrl:", vodUrl);
+    // STEP 2 — Trim with ffmpeg
+    console.log("Trimming clip with ffmpeg...");
 
-    if (!vodUrl.startsWith("http")) {
-      return res.status(400).json({ error: "vodUrl must be absolute" });
-    }
-
-    const tmp = os.tmpdir();
-    const inputPath = path.join(tmp, `vod-${uuidv4()}.m3u8`);
-    const outputPath = path.join(tmp, `clip-${uuidv4()}.mp4`);
-
-    console.log("Railway: downloading m3u8…");
-    const playlist = await fetch(vodUrl);
-    if (!playlist.ok) {
-      const txt = await playlist.text();
-      return res.status(400).json({ error: "Cannot download playlist", details: txt });
-    }
-
-    const playlistData = await playlist.text();
-    fs.writeFileSync(inputPath, playlistData);
-
-    console.log("Railway: saved m3u8 playlist");
-
-    const args = [
-      "-protocol_whitelist", "file,http,https,tcp,tls",
-      "-allowed_extensions", "ALL",
+    await run("ffmpeg", [
       "-ss", startTime,
       "-to", endTime,
-      "-i", inputPath,
-      "-c:v", "copy",
-      "-c:a", "copy",
+      "-i", downloadPath,
+      "-c", "copy",
       "-y",
-      outputPath
-    ];
+      clipPath
+    ]);
 
-    console.log("Railway: running ffmpeg:", args.join(" "));
+    console.log("FFmpeg done:", clipPath);
 
-    const ff = spawn("ffmpeg", args);
+    if (!fs.existsSync(clipPath)) {
+      throw new Error("Clip not generated");
+    }
 
-    let ffError = "";
-    ff.stderr.on("data", (d) => (ffError += d.toString()));
-
-    ff.on("close", async (code) => {
-      console.log("Railway: ffmpeg finished:", code);
-      if (code !== 0) {
-        return res.status(500).json({ error: "FFmpeg failed", details: ffError });
-      }
-
-      if (!fs.existsSync(outputPath)) {
-        return res.status(500).json({ error: "Output file missing" });
-      }
-
-      const mp4 = fs.readFileSync(outputPath);
-
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader("Content-Disposition", `attachment; filename=clip.mp4`);
-      res.send(mp4);
-
-      fs.unlinkSync(inputPath);
-      fs.unlinkSync(outputPath);
-    });
+    // STEP 3 — Send final MP4
+    const mp4 = fs.readFileSync(clipPath);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Disposition", "attachment; filename=clip.mp4");
+    res.send(mp4);
 
   } catch (err) {
-    console.error("Railway fatal error:", err);
-    res.status(500).json({ error: String(err) });
+    console.error("Error:", err);
+    return res.status(500).json({ error: "FFmpeg or yt-dlp failed", details: err });
+  } finally {
+    // Cleanup
+    try { fs.unlinkSync(downloadPath); } catch {}
+    try { fs.unlinkSync(clipPath); } catch {}
   }
 });
 
-app.get("/", (req, res) => res.send("FFmpeg service OK"));
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("FFmpeg running on port", port));
+app.listen(process.env.PORT || 3000, () =>
+  console.log("FFmpeg service running")
+);
