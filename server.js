@@ -1,109 +1,86 @@
-// ------------------------------
-// RAILWAY FFMPEG CLIP SERVICE
-// ------------------------------
 import express from "express";
 import cors from "cors";
-import fs from "fs/promises";
-import path from "path";
 import fetch from "node-fetch";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
+import fs from "fs/promises";
+import path from "path";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Force ffmpeg path
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "50mb" }));
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "OK - FFmpeg server running" });
+  res.send("FFmpeg service OK");
 });
 
-// Helper: seconds or HH:MM:SS → seconds
+// Convert HH:MM:SS to seconds
 function toSeconds(t) {
   if (typeof t === "number") return t;
-  const parts = String(t).split(":").map(Number);
-
+  const parts = t.split(":").map(Number);
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return Number(parts[0]) || 0;
+  return Number(t);
 }
 
 app.post("/clip", async (req, res) => {
+  const { vodUrl, startTime, endTime } = req.body;
+
+  if (!vodUrl) return res.status(400).json({ error: "vodUrl missing" });
+
+  console.log("📩 Received clip request:", { vodUrl, startTime, endTime });
+
+  const tempDir = path.join(__dirname, "temp");
+  await fs.mkdir(tempDir, { recursive: true });
+
+  const outPath = path.join(tempDir, `clip-${Date.now()}.mp4`);
+
   try {
-    const { vodUrl, startTime, endTime } = req.body;
-
-    if (!vodUrl || !startTime || !endTime) {
-      return res.status(400).json({ error: "vodUrl, startTime, endTime are required" });
+    if (!vodUrl.startsWith("http")) {
+      return res.status(400).json({ error: "vodUrl must be absolute HTTP URL" });
     }
 
-    if (!vodUrl.startsWith("http://") && !vodUrl.startsWith("https://")) {
-      return res.status(400).json({ error: "vodUrl must be an absolute URL" });
-    }
+    console.log("🎥 Using FFmpeg directly on m3u8:", vodUrl);
 
-    console.log("Received clip request:", { vodUrl, startTime, endTime });
+    const duration = toSeconds(endTime) - toSeconds(startTime);
 
-    // Paths
-    const tmpDir = path.join(__dirname, "tmp");
-    await fs.mkdir(tmpDir, { recursive: true });
-
-    const outputPath = path.join(tmpDir, `clip-${Date.now()}.mp4`);
-
-    const startSec = toSeconds(startTime);
-    const endSec = toSeconds(endTime);
-    const duration = endSec - startSec;
-
-    console.log("Parsed duration:", duration, "seconds");
-
-    // FFmpeg command
     await new Promise((resolve, reject) => {
-      const cmd = ffmpeg(vodUrl)
-        .inputOptions([
-          "-protocol_whitelist", "file,http,https,tcp,tls",
-          "-allowed_extensions", "ALL"
-        ])
-        .setStartTime(startSec)
+      ffmpeg(vodUrl)
+        .setStartTime(startTime)
         .setDuration(duration)
-        .outputOptions([
-          "-c:v copy",
-          "-c:a copy",
-          "-avoid_negative_ts make_zero"
-        ])
-        .output(outputPath)
+        .inputOptions(["-protocol_whitelist", "file,http,https,tcp,tls"])
+        .outputOptions(["-c copy"])
         .on("start", (cmd) => console.log("FFmpeg:", cmd))
-        .on("end", resolve)
-        .on("error", reject)
-        .run();
+        .on("progress", (info) => console.log("FFmpeg progress:", info))
+        .on("error", (err) => reject(err))
+        .on("end", () => resolve())
+        .save(outPath);
     });
 
-    // Read output file
-    const mp4 = await fs.readFile(outputPath);
+    const buffer = await fs.readFile(outPath);
+    await fs.unlink(outPath).catch(() => {});
 
-    if (!mp4 || mp4.length < 2000) {
-      return res.status(500).json({ error: "Generated MP4 is empty or invalid" });
-    }
-
-    console.log("Sending MP4, size:", mp4.length);
+    console.log("✅ Sending clipped MP4:", buffer.length, "bytes");
 
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", "attachment; filename=clip.mp4");
-    res.send(mp4);
-
-    await fs.unlink(outputPath).catch(() => {});
+    return res.send(buffer);
   } catch (err) {
-    console.error("Clip processing error:", err);
-    res.status(500).json({
+    console.error("❌ FFmpeg Error:", err);
+
+    return res.status(500).json({
       error: "FFmpeg failed",
-      details: err.message ?? String(err)
+      details: err.message,
     });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("FFmpeg server running on port", PORT));
+app.listen(PORT, () => console.log("🚀 Railway FFmpeg service running on", PORT));
