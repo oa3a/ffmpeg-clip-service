@@ -1,38 +1,25 @@
-# Dockerfile
-FROM node:18-bullseye
+# Use official Node image
+FROM node:18-slim
 
-# keep noninteractive
-ARG DEBIAN_FRONTEND=noninteractive
-
-# Install system packages including ffmpeg, python & pip
+# Install dependencies including ffmpeg
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      ffmpeg \
-      python3 \
-      python3-pip \
-      ca-certificates \
-      git \
-      curl && \
-    pip3 install --no-cache-dir yt-dlp && \
+    apt-get install -y ffmpeg python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
+# Create app directory
 WORKDIR /usr/src/app
 
-# copy package manifest first for caching
-COPY package.json package-lock.json* ./
+# Copy package files first for layer caching
+COPY package*.json ./
 
-# Use npm install (safe if package-lock missing). Use --production in prod images.
-RUN npm install --no-audit --no-fund --production
+# Install npm deps
+RUN npm install --production
 
-# Copy rest of the app
+# Copy app source
 COPY . .
 
-# Expose port
+# Expose service port
 EXPOSE 3000
 
-# Ensure logs printed immediately
-ENV NODE_ENV=production
-ENV TZ=UTC
-
-# Start
+# Run server
 CMD ["node", "server.js"]
