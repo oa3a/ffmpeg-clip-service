@@ -1,86 +1,189 @@
-import express from "express";
-import cors from "cors";
-import fetch from "node-fetch";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegStatic from "ffmpeg-static";
-import fs from "fs/promises";
-import path from "path";
-import { fileURLToPath } from "url";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-ffmpeg.setFfmpegPath(ffmpegStatic);
+// server.js - robust clip service using yt-dlp + ffmpeg
+const express = require('express');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const fsPromises = require('fs').promises;
+const os = require('os');
+const path = require('path');
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: '50mb' }));
 
-// Health check
-app.get("/", (req, res) => {
-  res.send("FFmpeg service OK");
-});
-
-// Convert HH:MM:SS to seconds
-function toSeconds(t) {
-  if (typeof t === "number") return t;
-  const parts = t.split(":").map(Number);
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return Number(t);
+// Helpers
+function safeLog(...args) { console.log(...args); }
+function isAbsoluteHttpUrl(s) {
+  return typeof s === 'string' && (s.startsWith('http://') || s.startsWith('https://'));
+}
+function normalizeTime(value) {
+  // Accept number seconds or "HH:MM:SS" or "mm:ss"
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.floor(value).toString();
+  if (typeof value === 'string') return value;
+  throw new Error('Invalid time format');
+}
+function runCommand(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => (stdout += d.toString()));
+    proc.stderr.on('data', (d) => (stderr += d.toString()));
+    proc.on('error', (err) => reject({ code: 'spawn_error', error: err, stderr, stdout }));
+    proc.on('close', (code, signal) => {
+      if (code === 0) resolve({ stdout, stderr });
+      else reject({ code, signal, stderr, stdout });
+    });
+  });
 }
 
-app.post("/clip", async (req, res) => {
-  const { vodUrl, startTime, endTime } = req.body;
+// Endpoint
+app.post('/clip', async (req, res) => {
+  const body = req.body || {};
+  const vodUrl = body.vodUrl;
+  const startTime = body.startTime;
+  const endTime = body.endTime;
 
-  if (!vodUrl) return res.status(400).json({ error: "vodUrl missing" });
+  if (!vodUrl || !isAbsoluteHttpUrl(vodUrl)) {
+    return res.status(400).json({ error: 'vodUrl required and must be absolute (http/https)' });
+  }
+  if (startTime == null || endTime == null) {
+    return res.status(400).json({ error: 'startTime and endTime are required' });
+  }
 
-  console.log("📩 Received clip request:", { vodUrl, startTime, endTime });
+  const normalizedStart = normalizeTime(startTime);
+  const normalizedEnd = normalizeTime(endTime);
 
-  const tempDir = path.join(__dirname, "temp");
-  await fs.mkdir(tempDir, { recursive: true });
+  const tmpBase = os.tmpdir();
+  const workDir = fs.mkdtempSync(path.join(tmpBase, 'clipify-'));
+  const downloadPath = path.join(workDir, 'source.mp4');
+  const outputPath = path.join(workDir, 'clip.mp4');
 
-  const outPath = path.join(tempDir, `clip-${Date.now()}.mp4`);
+  safeLog('Clip request', { vodUrl, startTime: normalizedStart, endTime: normalizedEnd, workDir });
+
+  // Timeout guard: kill long-running processes after X ms
+  const MAX_JOB_MS = Number(process.env.MAX_JOB_MS || 4 * 60 * 1000); // 4 minutes default
+
+  let jobTimedOut = false;
+  const jobTimeout = setTimeout(() => {
+    jobTimedOut = true;
+  }, MAX_JOB_MS);
 
   try {
-    if (!vodUrl.startsWith("http")) {
-      return res.status(400).json({ error: "vodUrl must be absolute HTTP URL" });
+    // Step 1: Download with yt-dlp (always use yt-dlp for Twitch/HLS)
+    // Use -f best and write to a fixed filename
+    safeLog('Running yt-dlp to download VOD...');
+    try {
+      await runCommand('yt-dlp', ['-f', 'best', vodUrl, '-o', downloadPath], { timeout: MAX_JOB_MS });
+    } catch (err) {
+      // Provide detailed error
+      safeLog('yt-dlp failed:', err && (err.stderr || err));
+      throw new Error(`yt-dlp failed: ${err && (err.stderr || err.code || err.signal || JSON.stringify(err))}`);
     }
 
-    console.log("🎥 Using FFmpeg directly on m3u8:", vodUrl);
+    // Make sure file exists and has size
+    const st = await fsPromises.stat(downloadPath);
+    if (!st || st.size === 0) throw new Error('Downloaded file missing or empty');
 
-    const duration = toSeconds(endTime) - toSeconds(startTime);
+    safeLog('Downloaded VOD to', downloadPath, 'size', st.size);
 
-    await new Promise((resolve, reject) => {
-      ffmpeg(vodUrl)
-        .setStartTime(startTime)
-        .setDuration(duration)
-        .inputOptions(["-protocol_whitelist", "file,http,https,tcp,tls"])
-        .outputOptions(["-c copy"])
-        .on("start", (cmd) => console.log("FFmpeg:", cmd))
-        .on("progress", (info) => console.log("FFmpeg progress:", info))
-        .on("error", (err) => reject(err))
-        .on("end", () => resolve())
-        .save(outPath);
+    // Step 2: Trim with ffmpeg (use -ss / -to with input file)
+    // Use copy codecs for speed; if that fails we fallback to re-encode
+    safeLog('Running ffmpeg trim (copy codec) ...');
+    try {
+      // Use -ss before -i may be faster but less accurate for copy; keep simplicity: -ss after input with -accurate_seek can be used.
+      await runCommand('ffmpeg', [
+        '-hide_banner',
+        '-loglevel', 'warning',
+        '-y',
+        '-ss', normalizedStart,
+        '-to', normalizedEnd,
+        '-i', downloadPath,
+        '-c', 'copy',
+        outputPath
+      ], { timeout: MAX_JOB_MS });
+    } catch (errCopy) {
+      safeLog('ffmpeg copy failed, trying re-encode fallback, error:', errCopy && (errCopy.stderr || errCopy));
+      // fallback: re-encode to avoid format/copy issues
+      try {
+        await runCommand('ffmpeg', [
+          '-hide_banner',
+          '-loglevel', 'warning',
+          '-y',
+          '-ss', normalizedStart,
+          '-to', normalizedEnd,
+          '-i', downloadPath,
+          '-c:v', 'libx264',
+          '-c:a', 'aac',
+          '-movflags', 'faststart',
+          outputPath
+        ], { timeout: MAX_JOB_MS });
+      } catch (errRe) {
+        safeLog('ffmpeg re-encode failed:', errRe && (errRe.stderr || errRe));
+        throw new Error(`ffmpeg failed: ${errRe && (errRe.stderr || JSON.stringify(errRe))}`);
+      }
+    }
+
+    const stOut = await fsPromises.stat(outputPath);
+    if (!stOut || stOut.size === 0) throw new Error('FFmpeg produced empty output');
+
+    safeLog('Trimmed clip ready, size:', stOut.size);
+
+    // Stream file to response (don't load whole file into memory)
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
+    res.setHeader('Content-Length', stOut.size);
+
+    const readStream = fs.createReadStream(outputPath);
+    readStream.pipe(res);
+
+    // cleanup after stream finishes
+    readStream.on('close', async () => {
+      clearTimeout(jobTimeout);
+      try {
+        await fsPromises.unlink(downloadPath).catch(() => {});
+        await fsPromises.unlink(outputPath).catch(() => {});
+        await fsPromises.rmdir(workDir).catch(() => {});
+        safeLog('Cleaned up workDir', workDir);
+      } catch (cleanupErr) {
+        safeLog('Cleanup error', cleanupErr);
+      }
     });
 
-    const buffer = await fs.readFile(outPath);
-    await fs.unlink(outPath).catch(() => {});
+    // If client disconnects, stop reading
+    req.on('close', () => {
+      readStream.destroy();
+    });
 
-    console.log("✅ Sending clipped MP4:", buffer.length, "bytes");
-
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", "attachment; filename=clip.mp4");
-    return res.send(buffer);
   } catch (err) {
-    console.error("❌ FFmpeg Error:", err);
-
-    return res.status(500).json({
-      error: "FFmpeg failed",
-      details: err.message,
-    });
+    clearTimeout(jobTimeout);
+    safeLog('Clip processing failed:', err && (err.message || err));
+    // Try to include underlying stderr if present
+    const msg = err && err.message ? err.message : String(err);
+    res.status(500).json({ error: 'Failed to process clip', message: msg });
+    // cleanup
+    try {
+      await fsPromises.unlink(downloadPath).catch(() => {});
+      await fsPromises.unlink(outputPath).catch(() => {});
+      await fsPromises.rmdir(workDir).catch(() => {});
+    } catch (cleanupErr) {}
+  } finally {
+    if (jobTimedOut) {
+      safeLog('Job timed out (exceeded MAX_JOB_MS)');
+    }
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("🚀 Railway FFmpeg service running on", PORT));
+// Health
+app.get('/', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+
+// Catch uncaught exceptions
+process.on('uncaughtException', (e) => {
+  console.error('uncaughtException', e && e.stack ? e.stack : e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('unhandledRejection', e && e.stack ? e.stack : e);
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Clip service listening on ${port}`);
+});
