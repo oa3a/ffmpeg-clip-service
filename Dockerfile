@@ -1,28 +1,30 @@
-# Use official Node 18 base image
+# Use Node 18 as base image
 FROM node:18-bullseye
 
-# Update base system
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     ffmpeg \
-    yt-dlp \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
+# Install yt-dlp using pip
+RUN pip3 install --upgrade yt-dlp
+
+# Set working directory
 WORKDIR /app
 
-# Copy package.json first (for caching)
+# Copy package.json first (caching)
 COPY package*.json ./
 
-# Install node deps (production only)
+# Install Node dependencies
 RUN npm install --omit=dev
 
-# Copy rest of project
+# Copy all project files
 COPY . .
 
 # Expose port
 EXPOSE 3000
 
-# Run the server
+# Start server
 CMD ["node", "server.js"]
