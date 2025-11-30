@@ -1,25 +1,28 @@
-# Dockerfile - installs ffmpeg + yt-dlp and runs Node server
+# Use official Node 18 base image
 FROM node:18-bullseye
 
-# Install system deps and yt-dlp (via pip)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      ffmpeg \
-      python3 \
-      python3-pip \
-      ca-certificates \
-      curl && \
-    pip3 install --no-cache-dir yt-dlp && \
-    rm -rf /var/lib/apt/lists/*
+# Update base system
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    ffmpeg \
+    yt-dlp \
+    && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src/app
+# Create app directory
+WORKDIR /app
 
-# copy and install dependencies
-COPY package.json package-lock.json* ./
-RUN npm ci --production
+# Copy package.json first (for caching)
+COPY package*.json ./
 
-# copy app
+# Install node deps (production only)
+RUN npm install --omit=dev
+
+# Copy rest of project
 COPY . .
 
+# Expose port
 EXPOSE 3000
+
+# Run the server
 CMD ["node", "server.js"]
