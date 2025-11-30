@@ -1,22 +1,29 @@
-# Dockerfile
-FROM node:18-bullseye
+FROM ubuntu:22.04
 
-# Install system deps: ffmpeg, python and pip
-RUN apt-get update && \
-    apt-get install -y ffmpeg python3 python3-pip ca-certificates && \
-    pip3 install --no-cache-dir yt-dlp && \
-    rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
 
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    curl \
+    wget \
+    ca-certificates \
+    ffmpeg \
+    yt-dlp \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create workdir
 WORKDIR /usr/src/app
 
-# Copy package.json then install (so Docker layer caching works)
+# Copy package.json first
 COPY package.json package-lock.json* ./
-RUN npm ci --only=production
 
-# Copy app
+RUN npm install --production
+
+# Copy the rest
 COPY . .
 
-# Ensure the server file uses CommonJS (server.cjs)
 EXPOSE 3000
 
-CMD ["node", "server.cjs"]
+CMD ["node", "server.js"]
