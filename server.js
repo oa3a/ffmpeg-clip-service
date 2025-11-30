@@ -1,114 +1,173 @@
-import express from "express";
-import cors from "cors";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegStatic from "ffmpeg-static";
-import fetch from "node-fetch";
-import fs from "fs/promises";
-import path from "path";
-import { fileURLToPath } from "url";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// server.cjs  (CommonJS)
+const express = require('express');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const fsPromises = require('fs').promises;
+const os = require('os');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(express.json({ limit: '50mb' }));
 
-// Ensure ffmpeg path is set
-ffmpeg.setFfmpegPath(ffmpegStatic);
+// Simple concurrency guard: allow 1 job at a time to avoid OOM/segfaults
+let activeJobs = 0;
+const MAX_CONCURRENT_JOBS = Number(process.env.MAX_CONCURRENT_JOBS || 1);
 
-app.use(cors());
-app.use(express.json());
-
-// Health check endpoint
-app.get("/", (req, res) => {
-  res.json({
-    status: "Railway FFmpeg Service Running",
-    version: "1.0.0",
-    endpoints: ["/clip"],
+// Helper to run a command and collect stderr
+function runCommand(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, opts);
+    let stderr = '';
+    let stdout = '';
+    if (p.stdout) p.stdout.on('data', (d) => { stdout += d.toString(); });
+    if (p.stderr) p.stderr.on('data', (d) => { stderr += d.toString(); });
+    p.on('error', (err) => reject({ code: null, error: err, stderr, stdout }));
+    p.on('close', (code, signal) => {
+      if (code !== 0) {
+        reject({ code, signal, stderr, stdout });
+      } else {
+        resolve({ code, signal, stderr, stdout });
+      }
+    });
   });
-});
+}
 
-// Clip endpoint
-app.post("/clip", async (req, res) => {
-  const tempDir = path.join(__dirname, "temp");
-  await fs.mkdir(tempDir, { recursive: true });
+// parse times: accepts seconds (number) or "HH:MM:SS" or "MM:SS" or stringified number
+function parseTimeToSeconds(t) {
+  if (typeof t === 'number' && Number.isFinite(t)) return Math.max(0, t);
+  const s = String(t || '').trim();
+  if (s.includes(':')) {
+    const parts = s.split(':').map(Number).reverse(); // seconds, minutes, hours
+    let seconds = 0;
+    if (!Number.isFinite(parts[0])) return NaN;
+    seconds += parts[0];
+    if (parts.length > 1 && Number.isFinite(parts[1])) seconds += parts[1] * 60;
+    if (parts.length > 2 && Number.isFinite(parts[2])) seconds += parts[2] * 3600;
+    return seconds;
+  }
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+}
 
-  const inputPath = path.join(tempDir, `input-${Date.now()}.mp4`);
-  const outputPath = path.join(tempDir, `output-${Date.now()}.mp4`);
+app.post('/clip', async (req, res) => {
+  const { vodUrl, startTime, endTime } = req.body || {};
 
   try {
-    const { vodUrl, startTime, endTime } = req.body;
-
-    if (!vodUrl || startTime == null || endTime == null) {
-      return res.status(400).json({ error: "Missing required fields" });
+    if (!vodUrl || typeof vodUrl !== 'string') {
+      return res.status(400).json({ error: 'vodUrl is required and must be a string' });
+    }
+    if (startTime == null || endTime == null) {
+      return res.status(400).json({ error: 'startTime and endTime are required' });
     }
 
-    console.log("Received clip job:", { vodUrl, startTime, endTime });
+    // concurrency guard
+    if (activeJobs >= MAX_CONCURRENT_JOBS) {
+      return res.status(429).json({ error: 'Too many concurrent jobs, try again later' });
+    }
+    activeJobs += 1;
 
-    // Detect if playlist
-    const isM3U8 = vodUrl.endsWith(".m3u8");
+    console.log('Clip request:', { vodUrl, startTime, endTime });
 
-    if (isM3U8) {
-      console.log("Processing m3u8 stream directly with FFmpeg");
+    const tmpdir = path.join(os.tmpdir(), 'vod-to-viral');
+    await fsPromises.mkdir(tmpdir, { recursive: true });
 
-      await new Promise((resolve, reject) => {
-        ffmpeg(vodUrl)
-          .setStartTime(startTime)
-          .setDuration(endTime - startTime)
-          .inputOptions(["-protocol_whitelist", "file,http,https,tcp,tls"])
-          .outputOptions(["-c copy", "-avoid_negative_ts make_zero"])
-          .output(outputPath)
-          .on("end", resolve)
-          .on("error", reject)
-          .run();
-      });
-    } else {
-      console.log("Downloading full MP4 first…");
+    const downloadPath = path.join(tmpdir, `vod-${uuidv4()}.mp4`);
+    const outputPath = path.join(tmpdir, `clip-${uuidv4()}.mp4`);
 
-      const vodRes = await fetch(vodUrl);
-      if (!vodRes.ok) {
-        return res.status(400).json({ error: "Failed to fetch vodUrl" });
-      }
-
-      const vodBuffer = Buffer.from(await vodRes.arrayBuffer());
-      await fs.writeFile(inputPath, vodBuffer);
-
-      console.log("Running FFmpeg trim…");
-
-      await new Promise((resolve, reject) => {
-        ffmpeg(inputPath)
-          .setStartTime(startTime)
-          .setDuration(endTime - startTime)
-          .outputOptions(["-c copy", "-avoid_negative_ts make_zero"])
-          .output(outputPath)
-          .on("end", resolve)
-          .on("error", reject)
-          .run();
-      });
+    // Normalize times
+    const startSec = parseTimeToSeconds(startTime);
+    const endSec = parseTimeToSeconds(endTime);
+    if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) {
+      throw new Error(`Invalid startTime or endTime. startTime=${startTime}, endTime=${endTime}`);
+    }
+    const duration = endSec - startSec;
+    if (!(duration > 0)) {
+      throw new Error(`Invalid clip duration (end <= start). start=${startSec}, end=${endSec}`);
     }
 
-    const outputBuffer = await fs.readFile(outputPath);
+    // Step 1: Use yt-dlp to download to local MP4
+    console.log('Downloading VOD with yt-dlp to', downloadPath);
+    // Use -f bestvideo+bestaudio/best to ensure full mp4; -o sets path
+    // We will make yt-dlp produce a single file with extension .mp4
+    const ytdlpArgs = ['-f', 'best', vodUrl, '-o', downloadPath, '--no-warnings', '--no-progress'];
+    try {
+      await runCommand('yt-dlp', ytdlpArgs, { env: process.env });
+    } catch (err) {
+      console.error('yt-dlp failed:', err);
+      throw new Error(`yt-dlp failed: ${err.stderr || err.error?.message || JSON.stringify(err)}`);
+    }
 
-    res.set({
-      "Content-Type": "video/mp4",
-      "Content-Length": outputBuffer.length,
-      "Content-Disposition": 'attachment; filename="clip.mp4"',
+    // confirm file
+    let stats;
+    try {
+      stats = await fsPromises.stat(downloadPath);
+    } catch (e) {
+      throw new Error('yt-dlp did not produce a file');
+    }
+    console.log('Downloaded VOD size bytes:', stats.size);
+
+    // Step 2: Trim with ffmpeg (use -ss before -i for fast seek, or use -ss after -i if accurate)
+    // Use -ss start -t duration -i in that order with -c copy to be fast (works for most)
+    const ffArgs = [
+      '-ss', String(startSec),
+      '-i', downloadPath,
+      '-t', String(Math.max(0, duration)),
+      '-c', 'copy',
+      '-avoid_negative_ts', 'make_zero',
+      '-y',
+      outputPath
+    ];
+
+    console.log('Running ffmpeg with args:', ffArgs.join(' '));
+    try {
+      await runCommand('ffmpeg', ffArgs, { env: process.env });
+    } catch (err) {
+      console.error('ffmpeg failed:', err);
+      throw new Error(`ffmpeg failed: ${err.stderr || err.error?.message || JSON.stringify(err)}`);
+    }
+
+    // verify output
+    let outStats;
+    try {
+      outStats = await fsPromises.stat(outputPath);
+    } catch (e) {
+      throw new Error('ffmpeg did not produce an output file');
+    }
+    if (outStats.size === 0) throw new Error('ffmpeg produced empty output');
+
+    console.log('Output size bytes:', outStats.size);
+
+    // Stream file to client
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
+    const readStream = fs.createReadStream(outputPath);
+    readStream.on('end', async () => {
+      // Cleanup
+      try { await fsPromises.unlink(downloadPath).catch(()=>{}); } catch {}
+      try { await fsPromises.unlink(outputPath).catch(()=>{}); } catch {}
+      activeJobs = Math.max(0, activeJobs - 1);
+      console.log('Successfully finished request and cleaned up.');
     });
-
-    res.send(outputBuffer);
-
-    await fs.unlink(inputPath).catch(() => {});
-    await fs.unlink(outputPath).catch(() => {});
+    readStream.on('error', async (err) => {
+      console.error('Read stream error:', err);
+      activeJobs = Math.max(0, activeJobs - 1);
+      res.destroy(err);
+    });
+    readStream.pipe(res);
   } catch (err) {
-    console.error("Processing error", err);
-
-    res.status(500).json({
-      error: "FFmpeg failed",
-      details: err.message,
-    });
+    activeJobs = Math.max(0, activeJobs - 1);
+    console.error('Clip processing error:', err && (err.stack || err));
+    const message = (err && err.message) ? err.message : String(err);
+    // Be explicit: return textual failure with logs for easier debugging
+    res.status(500).json({ error: 'Failed to process clip', message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`FFmpeg Clip Service running on port ${PORT}`);
+// Health
+app.get('/', (req, res) => res.json({ status: 'ok' }));
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`FFmpeg clip service listening on ${port}`);
 });
