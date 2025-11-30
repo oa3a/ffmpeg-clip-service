@@ -1,25 +1,22 @@
-# Use official Node image
-FROM node:18-slim
+# Dockerfile
+FROM node:18-bullseye
 
-# Install dependencies including ffmpeg
+# Install system deps: ffmpeg, python and pip
 RUN apt-get update && \
-    apt-get install -y ffmpeg python3 python3-pip && \
+    apt-get install -y ffmpeg python3 python3-pip ca-certificates && \
+    pip3 install --no-cache-dir yt-dlp && \
     rm -rf /var/lib/apt/lists/*
 
-# Create app directory
 WORKDIR /usr/src/app
 
-# Copy package files first for layer caching
-COPY package*.json ./
+# Copy package.json then install (so Docker layer caching works)
+COPY package.json package-lock.json* ./
+RUN npm ci --only=production
 
-# Install npm deps
-RUN npm install --production
-
-# Copy app source
+# Copy app
 COPY . .
 
-# Expose service port
+# Ensure the server file uses CommonJS (server.cjs)
 EXPOSE 3000
 
-# Run server
-CMD ["node", "server.js"]
+CMD ["node", "server.cjs"]
